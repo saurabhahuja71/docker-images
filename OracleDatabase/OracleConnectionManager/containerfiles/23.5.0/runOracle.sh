@@ -57,7 +57,6 @@ trap _int SIGINT
 trap _term SIGTERM
 
 # Set SIGKILL handler
-# shellcheck disable=SC2173
 trap _kill SIGKILL
 
 ############ Removing /tmp/orod.log #####
