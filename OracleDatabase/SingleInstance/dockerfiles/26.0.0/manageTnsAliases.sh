@@ -8,33 +8,26 @@
 
 set -euo pipefail
 
-# Default wallet directory used for TCPS when none is provided.
-DEFAULT_WALLET_DIRECTORY="/opt/oracle/dg-wallet/sidb-standby-dg-client-wallet"
-
 # Print the CLI syntax and supported options for alias management.
 # Keep help text in one place so validation errors can point here.
 function usage() {
   cat <<'EOF'
 Usage:
-  manageTnsAliases.sh --file <tnsnames.ora> --alias <ALIAS> --upsert --host <HOST> [--protocol <TCP|TCPS>] [--port <PORT>] --service <SERVICE> [--ssl-server-dn <DN>] [--my-wallet-directory <DIR>] [--strict-dedupe]
+  manageTnsAliases.sh --file <tnsnames.ora> --alias <ALIAS> --upsert --host <HOST> [--protocol <TCP|TCPS>] [--port <PORT>] --service <SERVICE> [--ssl-server-dn <DN>] [--strict-dedupe]
   manageTnsAliases.sh --file <tnsnames.ora> --alias <ALIAS> --delete [--strict-dedupe]
 
 Options:
-  --file                 Target tnsnames.ora file path.
-  --alias                Alias name to manage.
-  --upsert               Insert or replace alias block.
-  --delete               Remove alias block(s).
-  --host                 Host/FQDN for connect descriptor (required for --upsert).
-  --protocol             Connect protocol: TCP or TCPS (default: TCP).
-  --port                 Listener port for connect descriptor (default: 1521 for TCP, 2484 for TCPS).
-  --service              SERVICE_NAME for connect descriptor (required for --upsert).
-  --ssl-server-dn        Optional SSL_SERVER_CERT_DN for strict DN match.
-  --my-wallet-directory  Wallet directory used in TCPS SECURITY block.
-  --strict-dedupe        Remove both managed and unmanaged duplicates before action.
-  --help                 Show this help.
-
-Environment:
-  MY_WALLET_DIRECTORY    Fallback wallet directory used for TCPS when --my-wallet-directory is not provided.
+  --file             Target tnsnames.ora file path.
+  --alias            Alias name to manage.
+  --upsert           Insert or replace alias block.
+  --delete           Remove alias block(s).
+  --host             Host/FQDN for connect descriptor (required for --upsert).
+  --protocol         Connect protocol: TCP or TCPS (default: TCP).
+  --port             Listener port for connect descriptor (default: 1521 for TCP, 2484 for TCPS).
+  --service          SERVICE_NAME for connect descriptor (required for --upsert).
+  --ssl-server-dn    Optional SSL_SERVER_CERT_DN for strict DN match.
+  --strict-dedupe    Remove both managed and unmanaged duplicates before action.
+  --help             Show this help.
 EOF
 }
 
@@ -121,52 +114,8 @@ function remove_legacy_alias_blocks() {
   mv "$tmp_file" "$file"
 }
 
-# Resolve the wallet directory from CLI or environment, then fall back to the default.
-function resolve_wallet_directory() {
-  local wallet_directory="$1"
-
-  if [[ -z "$wallet_directory" && -n "${MY_WALLET_DIRECTORY:-}" ]]; then
-    wallet_directory="$MY_WALLET_DIRECTORY"
-  fi
-
-  if [[ -z "$wallet_directory" ]]; then
-    wallet_directory="$DEFAULT_WALLET_DIRECTORY"
-  fi
-
-  printf '%s' "$wallet_directory"
-}
-
-# Sync generated tnsnames.ora to dbconfig path also.
-# Broker/DMON may resolve aliases from /opt/oracle/oradata/dbconfig/<ORACLE_SID>/tnsnames.ora.
-function sync_dbconfig_tnsnames_if_needed() {
-  local source_file="$1"
-  local db_unique_name="${ORACLE_SID:-}"
-  local dbconfig_dir dbconfig_file source_real target_real
-
-  if [[ -z "$db_unique_name" ]]; then
-    return 0
-  fi
-
-  dbconfig_dir="/opt/oracle/oradata/dbconfig/${db_unique_name}"
-  dbconfig_file="${dbconfig_dir}/tnsnames.ora"
-
-  if [[ ! -d "$dbconfig_dir" ]]; then
-    return 0
-  fi
-
-  source_real="$(readlink -f "$source_file" 2>/dev/null || printf '%s' "$source_file")"
-  target_real="$(readlink -f "$dbconfig_file" 2>/dev/null || printf '%s' "$dbconfig_file")"
-
-  # If both paths already resolve to the same file, nothing to sync.
-  if [[ "$source_real" == "$target_real" ]]; then
-    return 0
-  fi
-
-  cp "$source_file" "$dbconfig_file"
-}
-
 # Append a normalized managed alias block to the target tnsnames.ora file.
-# Include the optional TCPS security stanza always for TCPS.
+# Include the optional TCPS security stanza only when a DN is provided.
 function append_managed_alias_block() {
   local file="$1"
   local alias_name="$2"
@@ -175,7 +124,6 @@ function append_managed_alias_block() {
   local protocol="$5"
   local service_name="$6"
   local ssl_dn="$7"
-  local wallet_directory="$8"
   local marker_alias begin_marker end_marker
 
   marker_alias="$(sanitize_marker_alias "$alias_name")"
@@ -199,13 +147,10 @@ function append_managed_alias_block() {
     echo "    (SERVER=dedicated)"
     echo "    (SERVICE_NAME=${service_name})"
     echo "  )"
-    if [[ "$protocol" == "TCPS" ]]; then
+    if [ -n "$ssl_dn" ]; then
       echo "  (SECURITY="
-      echo "    (SSL_SERVER_DN_MATCH=NO)"
-      echo "    (MY_WALLET_DIRECTORY=${wallet_directory})"
-      if [ -n "$ssl_dn" ]; then
-        echo "    (SSL_SERVER_CERT_DN=${ssl_dn})"
-      fi
+      echo "    (SSL_SERVER_DN_MATCH=YES)"
+      echo "    (SSL_SERVER_CERT_DN=${ssl_dn})"
       echo "  )"
     fi
     echo ")"
@@ -219,7 +164,6 @@ HOST=""
 PORT=""
 SERVICE_NAME=""
 SSL_SERVER_DN=""
-MY_WALLET_DIRECTORY_VALUE=""
 PROTOCOL="TCP"
 ACTION=""
 STRICT_DEDUPE=false
@@ -252,10 +196,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --ssl-server-dn)
       SSL_SERVER_DN="$2"
-      shift 2
-      ;;
-    --my-wallet-directory)
-      MY_WALLET_DIRECTORY_VALUE="$2"
       shift 2
       ;;
     --upsert)
@@ -313,12 +253,5 @@ if [[ "$STRICT_DEDUPE" == "true" ]]; then
 fi
 
 if [[ "$ACTION" == "upsert" ]]; then
-  RESOLVED_WALLET_DIRECTORY=""
-  if [[ "$PROTOCOL" == "TCPS" ]]; then
-    RESOLVED_WALLET_DIRECTORY="$(resolve_wallet_directory "$MY_WALLET_DIRECTORY_VALUE")"
-  fi
-  append_managed_alias_block "$FILE" "$ALIAS_NAME" "$HOST" "$PORT" "$PROTOCOL" "$SERVICE_NAME" "$SSL_SERVER_DN" "$RESOLVED_WALLET_DIRECTORY"
+  append_managed_alias_block "$FILE" "$ALIAS_NAME" "$HOST" "$PORT" "$PROTOCOL" "$SERVICE_NAME" "$SSL_SERVER_DN"
 fi
-
-# Keep dbconfig tnsnames.ora in sync with the file updated by this script.
-sync_dbconfig_tnsnames_if_needed "$FILE"

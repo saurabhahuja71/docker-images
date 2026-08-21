@@ -280,32 +280,6 @@ function validate_peer_env() {
     fi
 }
 
-function add_trusted_cert_if_missing() {
-  local wallet_loc="$1"
-  local cert_file="$2"
-  local wallet_pwd="$3"
-  local out_file
-  out_file="$(mktemp)"
-
-  if orapki wallet add -wallet "${wallet_loc}" -trusted_cert -cert "${cert_file}" \
-    >"${out_file}" 2>&1 <<EOF
-${wallet_pwd}
-EOF
-  then
-    rm -f "${out_file}"
-    return 0
-  fi
-
-  if grep -q "PKI-04003" "${out_file}"; then
-    rm -f "${out_file}"
-    return 0
-  fi
-
-  cat "${out_file}" >&2
-  rm -f "${out_file}"
-  return 1
-}
-
 # Split a PEM bundle into individual cert files and import each one.
 # Skip cleanly when no trusted CA bundle was provided.
 function import_trusted_certs_from_bundle() {
@@ -338,7 +312,9 @@ function import_trusted_certs_from_bundle() {
     shopt -s nullglob
     for cert_file in "${temp_dir}"/*.pem; do
         [ -s "${cert_file}" ] || continue
-     add_trusted_cert_if_missing "${wallet_loc}" "${cert_file}" "${wallet_pwd}"
+        orapki wallet add -wallet "${wallet_loc}" -trusted_cert -cert "${cert_file}" <<EOF
+${wallet_pwd}
+EOF
     done
     shopt -u nullglob
 }
@@ -358,27 +334,6 @@ function resolve_tcps_secret_file() {
         return 0
     fi
     return 1
-}
-
-############# Function for setting up the Data Guard client wallet symlink ####################
-function setup_dg_client_wallet_symlink() {
-    echo -e "\n\nSetting up Data Guard client wallet symlink in ${DG_CLIENT_WALLET_LOC}...\n"
-
-    # Make sure the base Data Guard wallet directory exists.
-    mkdir -p "${DG_WALLET_BASE}"
-
-    # If the symlink already points to the current database wallet, keep it.
-    if [ -L "${DG_CLIENT_WALLET_LOC}" ] && [ "$(readlink "${DG_CLIENT_WALLET_LOC}")" = "${WALLET_LOC}" ]; then
-        return 0
-    fi
-
-    # If a stale symlink, file, or directory exists at this path, replace it safely.
-    if [ -L "${DG_CLIENT_WALLET_LOC}" ] || [ -e "${DG_CLIENT_WALLET_LOC}" ]; then
-        rm -rf "${DG_CLIENT_WALLET_LOC}"
-    fi
-
-    # Create: /opt/oracle/dg-wallet/sidb-standby-dg-client-wallet -> ${WALLET_LOC}
-    ln -s "${WALLET_LOC}" "${DG_CLIENT_WALLET_LOC}"
 }
 
 ############# Function for setting up the client wallet ######################################
@@ -511,7 +466,7 @@ function disable_tcps() {
     reconfigure_listener
   fi
   # Deleting the wallet Directories
-  rm -rf "$WALLET_LOC" "$CLIENT_WALLET_LOC" "$DG_CLIENT_WALLET_LOC"
+  rm -rf "$WALLET_LOC" "$CLIENT_WALLET_LOC"
 }
 
 ###########################################
@@ -535,14 +490,6 @@ PKCS12_PWD=$(openssl rand -hex 8)
 
 # Client wallet location
 CLIENT_WALLET_LOC="${ORACLE_BASE}/oradata/clientWallet/${ORACLE_SID}"
-
-# Data Guard client wallet symlink location.
-# Default creates:
-# /opt/oracle/dg-wallet/sidb-standby-dg-client-wallet -> /opt/oracle/oradata/dbconfig/${ORACLE_SID}/.tls-wallet
-DG_WALLET_BASE="${DG_WALLET_BASE:-${ORACLE_BASE}/dg-wallet}"
-DG_CLIENT_WALLET_NAME="${DG_CLIENT_WALLET_NAME:-sidb-standby-dg-client-wallet}"
-DG_CLIENT_WALLET_LOC="${DG_WALLET_BASE}/${DG_CLIENT_WALLET_NAME}"
-MY_WALLET_DIRECTORY="${MY_WALLET_DIRECTORY:-${DG_CLIENT_WALLET_LOC}}"
 
 DG_PEER_ENABLED="${DG_PEER_ENABLED:-false}"
 DG_PEER_PORT="${DG_PEER_PORT:-2484}"
@@ -635,10 +582,6 @@ ${WALLET_PWD}
 EOF
 
 echo -e "\nOracle Wallet location: ${WALLET_LOC}\n"
-
-# Create or refresh the Data Guard client wallet symlink.
-# This keeps /opt/oracle/dg-wallet/sidb-standby-dg-client-wallet pointing to the server wallet location.
-setup_dg_client_wallet_symlink
 
 if [ "${CUSTOM_CERTS}" == false ]; then
     # Create a self-signed certificate using orapki utility; VALIDITY: 365 days
