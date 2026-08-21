@@ -405,7 +405,7 @@ For example, `DB0515_PDB1:tcokeprim.example.com:tcokenodes.example.com` means:
 
 **NOTE:** If you mount a DB credentials wallet for `dbca -createTrueCacheInstance` through `TRUE_CACHE_DB_CREDENTIAL_WALLET_DIR`, the wallet covers the DBCA create step. Primary-side service registration can still stay manual with `AUTO_TC_SVC_REGISTRATION="false"`, or it can be automated with `AUTO_TC_SVC_REGISTRATION="true"` when the primary-host helper script has been installed.
 
-When the primary pod also uses the same True Cache extension image, the sample script [samples/truecache/configure-primary-truecache-service.sh](/scratch/sauahuja/gobin/goprojects/src/github.com/user/dboper/docker-images/OracleDatabase/SingleInstance/samples/truecache/configure-primary-truecache-service.sh) is already prebaked at `/home/oracle/configure-primary-truecache-service.sh`, so `AUTO_TC_SVC_REGISTRATION="true"` does not require a separate manual copy step. If the primary runs outside that extension-image workflow, copy the same script to the primary host at `/home/oracle/configure-primary-truecache-service.sh`, or use a custom location exposed through `PRIMARY_TC_SERVICE_SCRIPT_PATH`. Keep it owned by the Oracle software owner and executable.
+When the primary pod also uses the same True Cache extension image, the sample script [samples/truecache/configure-primary-truecache-service.sh](../../samples/truecache/configure-primary-truecache-service.sh) is already prebaked at `/home/oracle/configure-primary-truecache-service.sh`, so `AUTO_TC_SVC_REGISTRATION="true"` does not require a separate manual copy step. If the primary runs outside that extension-image workflow, copy the same script to the primary host at `/home/oracle/configure-primary-truecache-service.sh`, or use a custom location exposed through `PRIMARY_TC_SERVICE_SCRIPT_PATH`. Keep it owned by the Oracle software owner and executable.
 
 On RAC primaries, validate the real scheduler runtime before relying on `AUTO_TC_SVC_REGISTRATION="true"`. A matching `externaljob.ora` is not enough by itself; run a `DBMS_SCHEDULER` executable smoke test and verify the generated `/tmp/extjob_id_test.out` file shows the Oracle DB software owner, for example `uid=... (oracle)`. If the file shows any other OS user, correct the scheduler runtime so it launches the helper under the Oracle DB software owner.
 
@@ -592,11 +592,276 @@ Sample Output for a working Truecache setup for above SQL query:
 
 ```bash
 SQL> select database_name,open_mode,database_role from v$database ;
- 
+
 DATABASE_NAME             OPEN_MODE            DATABASE_ROLE
 ------------------------- -------------------- ----------------
 ORCLCDB                   READ ONLY WITH APPLY TRUE CACHE
 ```
+
+## Minimal Enterprise Edition deployment with TCPS on primary and True Cache
+
+This section describes a complete standalone Podman deployment with **TCPS client access on both sides**:
+
+- Primary Database container: TCP **1521** and TCPS **2484**
+- True Cache container: TCP **1521** and TCPS **2484** (on a single host, map True Cache TCPS to a free host port such as **2485** because primary already uses host **2484**)
+
+Enterprise Edition service names `ORCLCDB` / `ORCLPDB1` are used. Adjust host paths, passwords, image tags, and IP addresses for your environment.
+
+**Note:** Application and admin clients use TCPS to reach each database. The True Cache bootstrap path still uses `PRIMARY_DB_CONN_STR` over **TCP 1521** between the containers (for example `prod:1521/ORCLCDB`). That inter-container setup link is separate from client-facing TCPS endpoints.
+
+### Prerequisites
+
+- Podman 4.2 or later on Oracle Linux 8.7 or later
+- Base Single Instance image built (see the [main SIDB README](../../README.md))
+- True Cache extension image built, for example:
+
+```bash
+./buildExtensions.sh -x truecache -b oracle/database:23.26.0-ee -t oracle/database-ext-truecache:23.26.0-ee
+```
+
+### Security material used in this deployment
+
+| Material | Purpose |
+| --- | --- |
+| Host RSA key pair (`key.pem` / `key.pub`) and encrypted password file | Secure Podman secrets (`oracle_pwd`, `oracle_pwd_privkey`). This is **not** used for TCPS. |
+| `ENABLE_TCPS=true` on the **primary** | TCPS listener on container port **2484** and a self-signed server certificate plus client wallet under `/opt/oracle/oradata/clientWallet/$ORACLE_SID` in the primary. |
+| `ENABLE_TCPS=true` on the **True Cache** container | Same TCPS setup for True Cache (container port **2484**, client wallet under `/opt/oracle/oradata/clientWallet/$ORACLE_SID` in the True Cache container). |
+| Custom `cert.crt` / `client.key` | Optional on either container via `TCPS_CERTS_LOCATION` (see [TCPS in the main README](../../README.md#configuring-tcps-connections-for-oracle-database-supported-from-version-1930-onwards)). |
+| True Cache bootstrap to primary | `PRIMARY_DB_CONN_STR` uses **TCP 1521** (for example `prod:1521/ORCLCDB`). |
+
+### 1. Define environment values
+
+```bash
+export HOST_DATA_ROOT=/scratch/oradata
+export DB_PASSWORD='<your-password>'
+export PRIMARY_DB_NAME=ORCLCDB
+export IMAGE=oracle/database-ext-truecache:23.26.0-ee
+```
+
+### 2. Create host directories
+
+Oracle processes in the image run as UID/GID `54321`. The host data directories must be writable by that user.
+
+```bash
+mkdir -p /opt/.secrets
+mkdir -p ${HOST_DATA_ROOT}/trueCache/prod
+mkdir -p ${HOST_DATA_ROOT}/trueCache/truedb
+mkdir -p ${HOST_DATA_ROOT}/trueCache/blob
+chown -R 54321:54321 ${HOST_DATA_ROOT}/trueCache
+```
+
+### 3. Create an encrypted database password secret
+
+Generate an RSA key pair, encrypt the database password with the public key, and remove the plaintext password file. Create Podman secrets named exactly `oracle_pwd` and `oracle_pwd_privkey` so the container can decrypt the password at runtime.
+
+```bash
+cd /opt/.secrets
+openssl genrsa -out key.pem 2048
+openssl rsa -in key.pem -out key.pub -pubout
+printf "%s" "${DB_PASSWORD}" > pwdfile.txt
+openssl pkeyutl -in pwdfile.txt -out pwdfile.enc -pubin -inkey key.pub -encrypt
+rm -f pwdfile.txt
+
+podman secret rm oracle_pwd 2>/dev/null || true
+podman secret rm oracle_pwd_privkey 2>/dev/null || true
+podman secret create oracle_pwd /opt/.secrets/pwdfile.enc
+podman secret create oracle_pwd_privkey /opt/.secrets/key.pem
+```
+
+### 4. Create the Podman network
+
+```bash
+podman network create --driver=bridge --subnet=172.20.1.0/24 truecache_pub1_n
+```
+
+If the network already exists, keep it and continue. For multi-host setups, use `macvlan` or `ipvlan` as described earlier in this document.
+
+### 5. Start the Primary Database container
+
+Map host ports **1521** (TCP), **5500** (EM Express), and **2484** (TCPS). Enable archivelog and force logging for True Cache. Setting `ENABLE_TCPS=true` configures TCPS with a self-signed certificate inside the container; no host TCPS certificate files are required.
+
+Ensure bidirectional name resolution for the True Cache hostname (for example `--add-host=truedb:172.20.1.98`, DNS, or a shared hosts file).
+
+```bash
+podman run -d --name prod --hostname prod --ip 172.20.1.2 \
+  --net=truecache_pub1_n \
+  -p 1521:1521 -p 5500:5500 -p 2484:2484 \
+  --secret=oracle_pwd \
+  --secret=oracle_pwd_privkey \
+  --add-host="truedb:172.20.1.98" \
+  --dns-search=example.com \
+  -e DOMAIN=example.com \
+  -e ORACLE_SID=ORCLCDB \
+  -e ORACLE_PDB=ORCLPDB1 \
+  -e ENABLE_ARCHIVELOG=true \
+  -e ENABLE_FORCE_LOGGING=true \
+  -e ENABLE_TCPS=true \
+  -v ${HOST_DATA_ROOT}/trueCache/prod:/opt/oracle/oradata \
+  ${IMAGE}
+```
+
+Monitor creation until the primary logs show:
+
+```text
+#########################
+DATABASE IS READY TO USE!
+#########################
+```
+
+```bash
+podman logs -f prod
+```
+
+### 6. Generate the True Cache blob from the primary
+
+Run this only after the primary is ready. The helper script writes `blobTestData.tar.gz` and depends on `dbcaUtils.sh` packaged in the True Cache extension image.
+
+```bash
+export PRIMARY_DB_NAME=ORCLCDB
+mkdir -p ${HOST_DATA_ROOT}/trueCache/blob
+podman exec prod bash -c "mkdir -p /var/tmp/truecache_blob && /opt/oracle/createBlob.sh /var/tmp/truecache_blob ${PRIMARY_DB_NAME} /opt/oracle/scripts/base/decryptPassword.sh"
+podman cp prod:/var/tmp/truecache_blob/blobTestData.tar.gz ${HOST_DATA_ROOT}/trueCache/blob/blobTestData.tar.gz
+chown -R 54321:54321 ${HOST_DATA_ROOT}/trueCache/blob
+```
+
+Confirm the host file exists before starting True Cache:
+
+```bash
+ls -l ${HOST_DATA_ROOT}/trueCache/blob/blobTestData.tar.gz
+```
+
+### 7. Start the True Cache container (TCP + TCPS)
+
+Mount the blob directory read-only and set `TRUE_CACHE_BLOB` to the in-container path. Point `PRIMARY_DB_CONN_STR` at the primary **TCP** listener (`hostname:1521/service`) for bootstrap.
+
+Set `ENABLE_TCPS=true` so True Cache also exposes TCPS on container port **2484**. On a single host where the primary already maps host port **2484**, publish True Cache TCPS as host **2485** → container **2484**. On separate hosts, both sides may use host port **2484**.
+
+```bash
+podman run -d --name truedb --hostname truedb --ip 172.20.1.98 \
+  --net truecache_pub1_n \
+  -p 1522:1521 \
+  -p 2485:2484 \
+  --secret=oracle_pwd \
+  --secret=oracle_pwd_privkey \
+  --add-host="prod:172.20.1.2" \
+  --dns-search=example.com \
+  -e DOMAIN=example.com \
+  -e ORACLE_SID=truedb \
+  -e PRIMARY_DB_CONN_STR=prod:1521/ORCLCDB \
+  -e AUTO_TC_SVC_REGISTRATION=false \
+  -e TRUE_CACHE=true \
+  -e ENABLE_TCPS=true \
+  -e TRUEDB_UNIQUE_NAME=truedb \
+  -e PDB_TC_SVCS="ORCLPDB1:sales1:sales1_tc" \
+  -v ${HOST_DATA_ROOT}/trueCache/blob:/opt/oracle/truecache/blob:ro \
+  -e TRUE_CACHE_BLOB=/opt/oracle/truecache/blob/blobTestData.tar.gz \
+  -v ${HOST_DATA_ROOT}/trueCache/truedb:/opt/oracle/oradata \
+  ${IMAGE}
+```
+
+Monitor until the True Cache database is ready:
+
+```bash
+podman logs -f truedb
+```
+
+With `AUTO_TC_SVC_REGISTRATION=false`, primary-side service association for entries in `PDB_TC_SVCS` remains a manual step (see the service registration notes later in this document).
+
+**If True Cache was created earlier without TCPS**, enable it on the running database and confirm the listener:
+
+```bash
+podman exec truedb /opt/oracle/configTcps.sh
+podman exec truedb lsnrctl status
+```
+
+Then ensure host port **2485** (or your chosen mapping) is published to container **2484**. Adding a new publish mapping requires recreating the container with the same data volume and `-p 2485:2484` (or connect to the container IP on the Podman network, for example `172.20.1.98:2484`).
+
+### 8. Verify connectivity
+
+Confirm both listeners include TCPS:
+
+```bash
+podman exec prod lsnrctl status
+podman exec truedb lsnrctl status
+```
+
+Expected endpoints (container side):
+
+- Primary: TCP `1521` and TCPS `2484`
+- True Cache: TCP `1521` and TCPS `2484`
+
+**TCP smoke test** (from a host with Instant Client, or use the mapped ports):
+
+```bash
+sqlplus sys/<your-password>@//localhost:1521/ORCLCDB as sysdba
+sqlplus sys/<your-password>@//localhost:1522/truedb as sysdba
+```
+
+#### Recommended ways to test TCPS
+
+The client wallet `sqlnet.ora` uses `WALLET_LOCATION` with `DIRECTORY = ./`. You **must** `cd` into the wallet directory before connecting so the wallet resolves. Setting only `TNS_ADMIN` to an absolute path without changing the working directory fails (often as `ORA-01017`).
+
+Copy the wallet from the target container. Directory name matches `ORACLE_SID` (True Cache is typically `TRUEDB`):
+
+```bash
+podman cp prod:/opt/oracle/oradata/clientWallet/ORCLCDB /tmp/clientWallet-prod
+podman cp truedb:/opt/oracle/oradata/clientWallet/TRUEDB /tmp/clientWallet-truedb
+```
+
+In `tnsnames.ora`, confirm `(PROTOCOL=TCPS)`. For host access in the single-host example, use `HOST=127.0.0.1` and `PORT=2484` (primary) or `PORT=2485` (True Cache host mapping).
+
+**Method 1 — `cd` + `TNS_ADMIN` + net service name (recommended)**
+
+```bash
+cd /tmp/clientWallet-prod
+export TNS_ADMIN=$(pwd)
+sqlplus sys/<your-password>@ORCLCDB as sysdba
+```
+
+True Cache:
+
+```bash
+cd /tmp/clientWallet-truedb
+export TNS_ADMIN=$(pwd)
+# ensure tnsnames.ora PORT matches the host mapping (2485 on single host)
+sqlplus sys/<your-password>@TRUEDB as sysdba
+```
+
+**Method 2 — Full connect descriptor (still `cd` into the wallet first)**
+
+```bash
+cd /tmp/clientWallet-prod
+export TNS_ADMIN=$(pwd)
+sqlplus sys/<your-password>@'(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=127.0.0.1)(PORT=2484))(CONNECT_DATA=(SERVICE_NAME=ORCLCDB)))' as sysdba
+```
+
+**Method 3 — From inside the container**
+
+```bash
+podman exec -it prod bash
+cd /opt/oracle/oradata/clientWallet/ORCLCDB
+export TNS_ADMIN=$(pwd)
+sqlplus sys/<your-password>@ORCLCDB as sysdba
+```
+
+```bash
+podman exec -it truedb bash
+cd /opt/oracle/oradata/clientWallet/TRUEDB
+export TNS_ADMIN=$(pwd)
+sqlplus sys/<your-password>@TRUEDB as sysdba
+```
+
+### Using your own TCPS certificates
+
+To replace self-signed TCPS material on the primary and/or True Cache:
+
+1. Provide `cert.crt` (certificate chain) and `client.key` on the host for that container.
+2. Mount the directory into the container and set `TCPS_CERTS_LOCATION` to the in-container path.
+3. Keep `ENABLE_TCPS=true` and publish container port **2484** (host **2484** for primary; host **2485** or another free port for True Cache on the same machine).
+
+Do not use the password-encryption files under `/opt/.secrets/key.pem` as TCPS certificates. Full TCPS options are documented in the [main SIDB README](../../README.md#configuring-tcps-connections-for-oracle-database-supported-from-version-1930-onwards).
+
+---
 
 ## Environment Variables Explained
 
@@ -604,7 +869,7 @@ ORCLCDB                   READ ONLY WITH APPLY TRUE CACHE
 
 **NOTE:** Primary-side service creation, startup, and True Cache association for these mappings are manual steps by default.
 
-When `AUTO_TC_SVC_REGISTRATION="true"`, the container invokes a primary-host script through `DBMS_SCHEDULER`. In the supported extension-image workflow, that helper is already prebaked at `/home/oracle/configure-primary-truecache-service.sh` in the image used for both the primary and True Cache pods. If the primary host is outside that workflow, copy [samples/truecache/configure-primary-truecache-service.sh](/scratch/sauahuja/gobin/goprojects/src/github.com/user/dboper/docker-images/OracleDatabase/SingleInstance/samples/truecache/configure-primary-truecache-service.sh) to `/home/oracle/configure-primary-truecache-service.sh` on the primary host and make it executable by the Oracle software owner, or set `PRIMARY_TC_SERVICE_SCRIPT_PATH` to the custom location chosen by the primary administrator. That helper script is responsible for creating and starting the primary service before it runs the primary-side DBCA association step.
+When `AUTO_TC_SVC_REGISTRATION="true"`, the container invokes a primary-host script through `DBMS_SCHEDULER`. In the supported extension-image workflow, that helper is already prebaked at `/home/oracle/configure-primary-truecache-service.sh` in the image used for both the primary and True Cache pods. If the primary host is outside that workflow, copy [samples/truecache/configure-primary-truecache-service.sh](../../samples/truecache/configure-primary-truecache-service.sh) to `/home/oracle/configure-primary-truecache-service.sh` on the primary host and make it executable by the Oracle software owner, or set `PRIMARY_TC_SERVICE_SCRIPT_PATH` to the custom location chosen by the primary administrator. That helper script is responsible for creating and starting the primary service before it runs the primary-side DBCA association step.
 
 | Parameter or option | Enterprise Edition usage | Free usage | Description | Mandatory/Optional |
 | --- | --- | --- | --- | --- |
@@ -617,6 +882,7 @@ When `AUTO_TC_SVC_REGISTRATION="true"`, the container invokes a primary-host scr
 | `PRIMARY_DB_CONN_STR` | Example: `prod:1521/ORCLCDB` | Example: `prod:1521/FREE` | Primary DB connection string in `hostname:port/Primary CDB service name` format. Automatic blob generation uses this connection to reach the Primary Database. | Mandatory |
 | `PRIMARY_DB_NAME` | Optional when the primary DB_NAME differs from the service name | Set to `FREE` | Primary source DB_NAME override. For Free standalone Podman, set this to `FREE`. | Optional for Enterprise Edition, recommended for Free |
 | `TRUE_CACHE` | Set to `true` | Set to `true` | Enables True Cache database creation. | Mandatory |
+| `ENABLE_TCPS` | Set to `true` on primary and on True Cache for client TCPS on container port `2484` | Set to `true` on primary and on True Cache when TCPS client access is required | Enables the TCPS listener and creates a self-signed wallet under `/opt/oracle/oradata/clientWallet/$ORACLE_SID` at database create time. On an existing database, run `/opt/oracle/configTcps.sh` inside the container. On one host, map primary `2484:2484` and True Cache `2485:2484` (or another free host port). | Optional for TCP-only clients; required for end-to-end TCPS client access |
 | `PDB_TC_SVCS` | Use `ORCLPDB1:<primary_service>:<truecache_service>` entries | Use `FREEPDB1:<primary_service>:<truecache_service>` entries | Semicolon-separated list of `Primary PDB:Primary Service Name:True Cache Service Name` mappings. Primary-side service creation and association are manual by default. | Mandatory |
 | `TRUE_CACHE_BLOB` | In-container path to the mounted blob generated from the Primary Database | In-container path to the mounted blob generated from the Primary Database | In-container path to a True Cache blob `.tar.gz` created from the Primary Database. For portable standalone Podman setup, generate the blob before starting the True Cache container, mount it into the container, and set this variable. | Conditional for True Cache |
 | `PRIMARY_DB_PWD_FILE` | Not typically used | Alternative to `TRUE_CACHE_BLOB` for Free | Path inside the True Cache container to a mounted copy of the primary database password file. For Free, provide either `TRUE_CACHE_BLOB` or `PRIMARY_DB_PWD_FILE` as the DBCA bootstrap input. | Conditional for Free |
