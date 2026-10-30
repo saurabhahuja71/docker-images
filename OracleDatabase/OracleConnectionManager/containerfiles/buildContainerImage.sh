@@ -115,7 +115,7 @@ done
 if [ "$VERSION" = "23.26.0" ]; then IMAGE_NAME="oracle/client-cman:23.26ai"; else IMAGE_NAME="oracle/client-cman:$VERSION"; fi
 # Resolve the digest before changing into the version directory.
 checkContainerRuntime
-if [[ "${VERSION}" == 19.* || "${VERSION}" == 21.* ]]; then BASE_IMAGE_DEFAULT="oraclelinux:7-slim"; else BASE_IMAGE_DEFAULT="oraclelinux:9"; fi
+if [[ "${VERSION}" == 21.* ]]; then BASE_IMAGE_DEFAULT="oraclelinux:7-slim"; else BASE_IMAGE_DEFAULT="oraclelinux:9"; fi
 resolve_base_image_metadata "${VERSION}" "${BASE_IMAGE_DEFAULT}" "${DOCKEROPS}"
 DOCKEROPS="${DOCKEROPS} ${BASE_IMAGE_BUILD_ARGS}"
 
